@@ -10,7 +10,7 @@ from task import input_t, output_t
 os.environ["CXX"] = "clang++"
 
 CPP_WRAPPER = """
-// Forward declarations
+// Forward declarations for the final kernel fusion implementation
 void hip_count_and_map_dispatches(torch::Tensor indices, torch::Tensor send_counts, torch::Tensor dispatch_map,
                                   int num_tokens, int experts_per_token, int num_local_experts);
 
@@ -28,10 +28,15 @@ void hip_reorganize_expert_data(torch::Tensor recv_buf, torch::Tensor recv_meta,
 void hip_count_backward_sends(torch::Tensor expert_meta, torch::Tensor expert_num_tokens,
                               torch::Tensor send_counts, int num_local_experts, int max_recv);
 
-void hip_gather_tokens(torch::Tensor expert_y, torch::Tensor expert_meta, torch::Tensor expert_num_tokens,
-                       torch::Tensor send_offsets, torch::Tensor temp_send_counts,
-                       torch::Tensor send_buf, torch::Tensor send_meta,
-                       int num_local_experts, int max_recv, int hidden_dim, int meta_dim);
+void hip_create_gather_maps(torch::Tensor expert_num_tokens, torch::Tensor expert_offsets,
+                            torch::Tensor token_to_expert_map, torch::Tensor token_to_idx_in_expert_map,
+                            int num_local_experts);
+
+void hip_gather_flat(torch::Tensor expert_y, torch::Tensor expert_meta,
+                     torch::Tensor token_to_expert_map, torch::Tensor token_to_idx_in_expert_map,
+                     torch::Tensor send_offsets, torch::Tensor temp_send_counts,
+                     torch::Tensor send_buf, torch::Tensor send_meta,
+                     int total_sends, int max_recv, int hidden_dim, int meta_dim);
 
 void hip_combine_tokens(torch::Tensor recv_meta, torch::Tensor recv_buf, torch::Tensor weights,
                        torch::Tensor out_tokens, int total_recv, int meta_dim, int experts_per_token);
@@ -41,8 +46,6 @@ CUDA_SRC = """
 #include <hip/hip_runtime.h>
 #include <hip/amd_detail/amd_hip_fp16.h>
 
-// Tunable block size for performance experimentation.
-// Values like 256, 512, or 1024 are good candidates.
 constexpr const int BLOCK_SIZE = 256;
 constexpr const int META_DIM = 5;
 
@@ -56,10 +59,9 @@ constexpr const int META_DIM = 5;
         } \
     } while (0)
 
-// Kernel 1: Count tokens per destination rank and create a map for permutation.
+// --- Dispatch Kernels (Unchanged) ---
 __global__ void count_and_map_kernel(const int* indices, int* send_counts, int* dispatch_map,
-                                     int num_tokens, int experts_per_token,
-                                     int num_local_experts) {
+                                     int num_tokens, int experts_per_token, int num_local_experts) {
     int tid = threadIdx.x + blockDim.x * blockIdx.x;
     if (tid >= num_tokens * experts_per_token) return;
     int token_idx = tid / experts_per_token;
@@ -73,7 +75,6 @@ __global__ void count_and_map_kernel(const int* indices, int* send_counts, int* 
     dispatch_map[map_offset + 2] = expert_idx;
 }
 
-// Kernel 2: Permute token data and metadata into contiguous send buffers.
 __global__ void permute_kernel(const __half* original_tokens, const int* indices, const int* dispatch_map,
                                const int* send_offsets, int* temp_send_counts,
                                __half* send_buf, int* send_meta,
@@ -81,16 +82,13 @@ __global__ void permute_kernel(const __half* original_tokens, const int* indices
                                int rank, int num_local_experts) {
     int tid = threadIdx.x + blockDim.x * blockIdx.x;
     if (tid >= num_tokens * experts_per_token) return;
-
     int map_offset = tid * 3;
     int dst_rank = dispatch_map[map_offset + 0];
     int token_idx = dispatch_map[map_offset + 1];
     int expert_idx = dispatch_map[map_offset + 2];
     int pos = atomicAdd(&temp_send_counts[dst_rank], 1);
     int final_pos = send_offsets[dst_rank] + pos;
-
     VECTORIZE_COPY(&send_buf[final_pos * hidden_dim], &original_tokens[token_idx * hidden_dim], hidden_dim);
-
     int meta_offset = final_pos * META_DIM;
     int expert_id = indices[token_idx * experts_per_token + expert_idx];
     send_meta[meta_offset + 0] = expert_id;
@@ -100,7 +98,6 @@ __global__ void permute_kernel(const __half* original_tokens, const int* indices
     send_meta[meta_offset + 4] = 0;
 }
 
-// Kernel 3: Reorganize received data for local experts.
 __global__ void reorganize_expert_kernel(const __half* recv_buf, const int* recv_meta,
                                         __half* expert_x, int* expert_meta,
                                         int* expert_num_tokens, int total_recv,
@@ -111,7 +108,6 @@ __global__ void reorganize_expert_kernel(const __half* recv_buf, const int* recv
     int global_eid = recv_meta[tid * meta_dim + 0];
     int local_eid = global_eid % num_local_experts;
     int pos = atomicAdd(&expert_num_tokens[local_eid], 1);
-
     if (pos < max_recv) {
         VECTORIZE_COPY(&expert_x[local_eid * max_recv * hidden_dim + pos * hidden_dim], &recv_buf[tid * hidden_dim], hidden_dim);
         for (int m = 0; m < meta_dim; m++) {
@@ -120,7 +116,9 @@ __global__ void reorganize_expert_kernel(const __half* recv_buf, const int* recv
     }
 }
 
-// Kernel 4: Count tokens to send back from each local expert.
+
+// --- Combine Kernels (Optimized Scheduling) ---
+
 __global__ void count_backward_kernel(const int* expert_meta, const int* expert_num_tokens,
                                       int* send_counts, int num_local_experts, int max_recv) {
     int local_eid = threadIdx.x + blockDim.x * blockIdx.x;
@@ -132,14 +130,32 @@ __global__ void count_backward_kernel(const int* expert_meta, const int* expert_
     }
 }
 
-// Kernel 5: Gather expert outputs into contiguous send buffers for the return trip.
-__global__ void gather_kernel(const __half* expert_y, const int* expert_meta, const int* expert_num_tokens,
-                              const int* send_offsets, int* temp_send_counts,
-                              __half* send_buf, int* send_meta,
-                              int num_local_experts, int max_recv, int hidden_dim, int meta_dim) {
-    int local_eid = blockIdx.x;
-    int token_idx_in_expert = threadIdx.x;
-    if (local_eid >= num_local_experts || token_idx_in_expert >= expert_num_tokens[local_eid]) return;
+// New Kernel to replace PyTorch-based map creation
+__global__ void create_gather_maps_kernel(const int* expert_num_tokens, const int* expert_offsets,
+                                          int* token_to_expert_map, int* token_to_idx_in_expert_map,
+                                          int num_local_experts) {
+    int local_eid = threadIdx.x + blockDim.x * blockIdx.x;
+    if (local_eid >= num_local_experts) return;
+
+    int num_tokens_in_expert = expert_num_tokens[local_eid];
+    int global_offset = expert_offsets[local_eid];
+
+    for (int i = 0; i < num_tokens_in_expert; ++i) {
+        token_to_expert_map[global_offset + i] = local_eid;
+        token_to_idx_in_expert_map[global_offset + i] = i;
+    }
+}
+
+__global__ void gather_flat_kernel(const __half* expert_y, const int* expert_meta,
+                                   const int* token_to_expert_map, const int* token_to_idx_in_expert_map,
+                                   const int* send_offsets, int* temp_send_counts,
+                                   __half* send_buf, int* send_meta,
+                                   int total_sends, int max_recv, int hidden_dim, int meta_dim) {
+    int tid = threadIdx.x + blockDim.x * blockIdx.x;
+    if (tid >= total_sends) return;
+
+    int local_eid = token_to_expert_map[tid];
+    int token_idx_in_expert = token_to_idx_in_expert_map[tid];
 
     const int* meta_read_ptr = &expert_meta[local_eid * max_recv * meta_dim + token_idx_in_expert * meta_dim];
     int dst_rank = meta_read_ptr[1];
@@ -154,7 +170,6 @@ __global__ void gather_kernel(const __half* expert_y, const int* expert_meta, co
     }
 }
 
-// Kernel 6: Combine received tokens back at the source.
 __global__ void combine_kernel(const int* recv_meta, const __half* recv_buf,
                               const float* weights, float* out_tokens,
                               int total_recv, int hidden_dim, int meta_dim, int experts_per_token) {
@@ -163,7 +178,6 @@ __global__ void combine_kernel(const int* recv_meta, const __half* recv_buf,
     int src_token = recv_meta[tid * meta_dim + 2];
     int src_k = recv_meta[tid * meta_dim + 3];
     float weight = weights[src_token * experts_per_token + src_k];
-    
     for (int h = 0; h < hidden_dim; h++) {
         float val = __half2float(recv_buf[tid * hidden_dim + h]) * weight;
         atomicAdd(&out_tokens[src_token * hidden_dim + h], val);
@@ -184,10 +198,16 @@ void hip_reorganize_expert_data(torch::Tensor recv_buf, torch::Tensor recv_meta,
     reorganize_expert_kernel<<<blocks, BLOCK_SIZE>>>((const __half*)recv_buf.data_ptr<at::Half>(), recv_meta.data_ptr<int>(), (__half*)expert_x.data_ptr<at::Half>(), expert_meta.data_ptr<int>(), expert_num_tokens.data_ptr<int>(), total_recv, num_local_experts, hidden_dim, max_recv, meta_dim);
 }
 void hip_count_backward_sends(torch::Tensor expert_meta, torch::Tensor expert_num_tokens, torch::Tensor send_counts, int num_local_experts, int max_recv) {
-    count_backward_kernel<<<1, num_local_experts>>>(expert_meta.data_ptr<int>(), expert_num_tokens.data_ptr<int>(), send_counts.data_ptr<int>(), num_local_experts, max_recv);
+    int blocks = (num_local_experts + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    count_backward_kernel<<<blocks, BLOCK_SIZE>>>(expert_meta.data_ptr<int>(), expert_num_tokens.data_ptr<int>(), send_counts.data_ptr<int>(), num_local_experts, max_recv);
 }
-void hip_gather_tokens(torch::Tensor expert_y, torch::Tensor expert_meta, torch::Tensor expert_num_tokens, torch::Tensor send_offsets, torch::Tensor temp_send_counts, torch::Tensor send_buf, torch::Tensor send_meta, int num_local_experts, int max_recv, int hidden_dim, int meta_dim) {
-    gather_kernel<<<dim3(num_local_experts), dim3(BLOCK_SIZE)>>>((const __half*)expert_y.data_ptr<at::Half>(), expert_meta.data_ptr<int>(), expert_num_tokens.data_ptr<int>(), send_offsets.data_ptr<int>(), temp_send_counts.data_ptr<int>(), (__half*)send_buf.data_ptr<at::Half>(), send_meta.data_ptr<int>(), num_local_experts, max_recv, hidden_dim, meta_dim);
+void hip_create_gather_maps(torch::Tensor expert_num_tokens, torch::Tensor expert_offsets, torch::Tensor token_to_expert_map, torch::Tensor token_to_idx_in_expert_map, int num_local_experts) {
+    int blocks = (num_local_experts + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    create_gather_maps_kernel<<<blocks, BLOCK_SIZE>>>(expert_num_tokens.data_ptr<int>(), expert_offsets.data_ptr<int>(), token_to_expert_map.data_ptr<int>(), token_to_idx_in_expert_map.data_ptr<int>(), num_local_experts);
+}
+void hip_gather_flat(torch::Tensor expert_y, torch::Tensor expert_meta, torch::Tensor token_to_expert_map, torch::Tensor token_to_idx_in_expert_map, torch::Tensor send_offsets, torch::Tensor temp_send_counts, torch::Tensor send_buf, torch::Tensor send_meta, int total_sends, int max_recv, int hidden_dim, int meta_dim) {
+    int blocks = (total_sends + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    gather_flat_kernel<<<blocks, BLOCK_SIZE>>>((const __half*)expert_y.data_ptr<at::Half>(), expert_meta.data_ptr<int>(), token_to_expert_map.data_ptr<int>(), token_to_idx_in_expert_map.data_ptr<int>(), send_offsets.data_ptr<int>(), temp_send_counts.data_ptr<int>(), (__half*)send_buf.data_ptr<at::Half>(), send_meta.data_ptr<int>(), total_sends, max_recv, hidden_dim, meta_dim);
 }
 void hip_combine_tokens(torch::Tensor recv_meta, torch::Tensor recv_buf, torch::Tensor weights, torch::Tensor out_tokens, int total_recv, int meta_dim, int experts_per_token) {
     int blocks = (total_recv + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -197,12 +217,12 @@ void hip_combine_tokens(torch::Tensor recv_meta, torch::Tensor recv_buf, torch::
 
 # Compile HIP module
 hip_module = load_inline(
-    name='hip_all2all_final_tuned',
+    name='hip_all2all_kernel_fusion',
     cpp_sources=[CPP_WRAPPER],
     cuda_sources=[CUDA_SRC],
     functions=[
         'hip_count_and_map_dispatches', 'hip_permute_tokens', 'hip_reorganize_expert_data',
-        'hip_count_backward_sends', 'hip_gather_tokens', 'hip_combine_tokens'
+        'hip_count_backward_sends', 'hip_create_gather_maps', 'hip_gather_flat', 'hip_combine_tokens'
     ],
     verbose=True,
     extra_cuda_cflags=["--offload-arch=gfx942", "-std=c++20"],
@@ -243,7 +263,6 @@ class HIPAllToAll:
         recv_buf = torch.empty(total_recv, cfg.hidden_dim, dtype=cfg.in_dtype, device=device)
         recv_meta = torch.empty(total_recv, self.META_DIM, dtype=torch.int32, device=device)
         
-        # Perform communication sequentially to avoid deadlocks.
         dist.all_to_all_single(recv_buf, send_buf, recv_counts_t.tolist(), send_counts_long.tolist())
         dist.all_to_all_single(recv_meta.view(-1), send_meta.view(-1), [c * self.META_DIM for c in recv_counts_t.tolist()], [c * self.META_DIM for c in send_counts_long.tolist()])
 
@@ -267,17 +286,29 @@ class HIPAllToAll:
         dist.all_to_all_single(recv_counts_t, send_counts_long)
         total_recv = int(recv_counts_t.sum().item())
 
-        send_offsets = torch.cumsum(send_counts, dim=0, dtype=torch.int32) - send_counts
-        temp_send_counts = torch.zeros_like(send_counts)
         total_sends = int(expert_num_tokens.sum().item())
-        send_buf = torch.empty(total_sends, cfg.hidden_dim, dtype=cfg.out_dtype, device=device)
-        send_meta = torch.empty(total_sends, self.META_DIM, dtype=torch.int32, device=device)
-        hip_module.hip_gather_tokens(expert_y, expert_meta, expert_num_tokens, send_offsets, temp_send_counts, send_buf, send_meta, self.num_local_experts, self.max_recv, cfg.hidden_dim, self.META_DIM)
+        if total_sends > 0:
+            send_offsets = torch.cumsum(send_counts, dim=0, dtype=torch.int32) - send_counts
+            temp_send_counts = torch.zeros_like(send_counts)
+            
+            # Use a dedicated kernel to create the gather maps efficiently.
+            expert_offsets = (torch.cumsum(expert_num_tokens, 0) - expert_num_tokens).to(torch.int32)
+            token_to_expert_map = torch.empty(total_sends, device=device, dtype=torch.int32)
+            token_to_idx_in_expert_map = torch.empty(total_sends, device=device, dtype=torch.int32)
+            hip_module.hip_create_gather_maps(expert_num_tokens, expert_offsets, token_to_expert_map, token_to_idx_in_expert_map, self.num_local_experts)
+
+            send_buf = torch.empty(total_sends, cfg.hidden_dim, dtype=cfg.out_dtype, device=device)
+            send_meta = torch.empty(total_sends, self.META_DIM, dtype=torch.int32, device=device)
+            
+            hip_module.hip_gather_flat(expert_y, expert_meta, token_to_expert_map, token_to_idx_in_expert_map, send_offsets, temp_send_counts, send_buf, send_meta, total_sends, self.max_recv, cfg.hidden_dim, self.META_DIM)
+        else: 
+             send_buf = torch.empty(0, cfg.hidden_dim, dtype=cfg.out_dtype, device=device)
+             send_meta = torch.empty(0, self.META_DIM, dtype=torch.int32, device=device)
+
 
         recv_buf = torch.empty(total_recv, cfg.hidden_dim, dtype=cfg.out_dtype, device=device)
         recv_meta = torch.empty(total_recv, self.META_DIM, dtype=torch.int32, device=device)
         
-        # Perform communication sequentially to avoid deadlocks.
         dist.all_to_all_single(recv_buf, send_buf, recv_counts_t.tolist(), send_counts_long.tolist())
         dist.all_to_all_single(recv_meta.view(-1), send_meta.view(-1), [c * self.META_DIM for c in recv_counts_t.tolist()], [c * self.META_DIM for c in send_counts_long.tolist()])
 
@@ -298,3 +329,4 @@ def custom_kernel(data: input_t) -> output_t:
     y = torch.zeros(cfg.max_num_tokens, cfg.hidden_dim, dtype=cfg.out_dtype, device=rank_data.x.device)
     hip_all2all.combine(y, rank_data.weights, expert_meta, expert_y, expert_num)
     return y[: rank_data.num_tokens]
+
