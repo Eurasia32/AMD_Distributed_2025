@@ -10,7 +10,9 @@ from task import input_t, output_t
 os.environ["CXX"] = "clang++"
 
 CPP_WRAPPER = """
-// --- V6 Kernels (some are reused) ---
+#include <torch/extension.h>
+
+// --- Reused Kernels ---
 void hip_count_and_map_dispatches(torch::Tensor indices, torch::Tensor send_counts, torch::Tensor dispatch_map,
                                   int num_tokens, int experts_per_token, int num_local_experts);
 void hip_unpack_and_reorganize(torch::Tensor recv_buf, torch::Tensor expert_x, torch::Tensor expert_meta,
@@ -29,19 +31,22 @@ void hip_unpack_to_intermediate(torch::Tensor recv_buf, torch::Tensor intermedia
 void hip_final_reduction_smem(torch::Tensor intermediate_buf, torch::Tensor weights, torch::Tensor out_tokens,
                               int num_tokens, int hidden_dim, int experts_per_token);
 
-// --- V7 New/Modified Kernels ---
-void hip_permute_and_pack_from_sorted_map(torch::Tensor original_tokens, torch::Tensor indices,
-                                          torch::Tensor sorted_dispatch_indices, torch::Tensor sorted_dispatch_map_flat,
-                                          torch::Tensor send_buf, torch::Tensor send_offsets,
-                                          torch::Tensor send_data_offsets, torch::Tensor send_meta_offsets,
-                                          int num_tokens, int experts_per_token, int hidden_dim, int rank, int num_local_experts);
+// --- V8 New/Modified Kernels ---
+void hip_create_sort_keys(torch::Tensor dispatch_map, torch::Tensor sort_keys, int total_dispatches);
+void hip_permute_and_pack_from_sorted_keys(
+    torch::Tensor original_tokens, torch::Tensor indices, torch::Tensor dispatch_map,
+    torch::Tensor sorted_keys, torch::Tensor send_buf,
+    torch::Tensor send_offsets_in_map, torch::Tensor send_data_offsets,
+    torch::Tensor send_meta_offsets, int total_dispatches,
+    int hidden_dim, int rank, int num_local_experts, int experts_per_token);
 """
 
 CUDA_SRC = """
 #include <hip/hip_runtime.h>
 #include <hip/amd_detail/amd_hip_fp16.h>
+#include <cstdint> // For uint64_t
 
-constexpr const int BLOCK_SIZE = 256; // Increased block size for potentially better occupancy
+constexpr const int BLOCK_SIZE = 256;
 constexpr const int META_DIM = 5;
 constexpr const int WORLD_SIZE = 8;
 
@@ -54,14 +59,13 @@ constexpr const int WORLD_SIZE = 8;
         } \\
     } while (0)
 
-// --- V6 Kernels (Unchanged, included for completeness) ---
-
+// --- V6/V7 Reused Kernels (unchanged) ---
 __global__ void count_and_map_kernel(const int* indices, int* send_counts, int* dispatch_map,
                                      int num_tokens, int experts_per_token, int num_local_experts) {
     __shared__ int s_send_counts[WORLD_SIZE];
     if (threadIdx.x < WORLD_SIZE) { s_send_counts[threadIdx.x] = 0; }
     __syncthreads();
-    for (int tid = threadIdx.x + blockDim.x * blockIdx.x; tid < num_tokens * experts_per_token; tid += gridDim.x * blockDim.x) {
+    for (int tid = threadIdx.x + blockDim.x * blockIdx.x; tid < num_tokens * experts_per_token; tid += gridDim.x * blockIdx.x) {
         int token_idx = tid / experts_per_token;
         int expert_idx = tid % experts_per_token;
         int expert_id = indices[token_idx * experts_per_token + expert_idx];
@@ -75,7 +79,6 @@ __global__ void count_and_map_kernel(const int* indices, int* send_counts, int* 
     __syncthreads();
     if (threadIdx.x < WORLD_SIZE) { atomicAdd(&send_counts[threadIdx.x], s_send_counts[threadIdx.x]); }
 }
-
 __global__ void unpack_and_reorganize_kernel(const unsigned char* recv_buf, __half* expert_x, int* expert_meta,
                                              int* expert_num_tokens, const int* recv_data_byte_offsets,
                                              const int* recv_meta_byte_offsets, const int* recv_counts,
@@ -103,7 +106,6 @@ __global__ void unpack_and_reorganize_kernel(const unsigned char* recv_buf, __ha
         for (int m = 0; m < META_DIM; ++m) meta_write_ptr[m] = meta_read_ptr[m];
     }
 }
-
 __global__ void count_backward_kernel(const int* expert_meta, const int* expert_num_tokens, int* send_counts, int num_local_experts, int max_recv) {
     int local_eid = blockIdx.x;
     int num_tokens_in_expert = expert_num_tokens[local_eid];
@@ -114,7 +116,6 @@ __global__ void count_backward_kernel(const int* expert_meta, const int* expert_
         }
     }
 }
-
 __global__ void gather_and_pack_kernel(const __half* expert_y, const int* expert_meta, const int* expert_num_tokens, int* temp_send_counts, unsigned char* send_buf, const int* send_data_offsets, const int* send_meta_offsets, int num_local_experts, int max_recv, int hidden_dim) {
     int local_eid = blockIdx.x;
     int token_idx_in_expert = threadIdx.x;
@@ -129,7 +130,6 @@ __global__ void gather_and_pack_kernel(const __half* expert_y, const int* expert
     int* meta_write_ptr = reinterpret_cast<int*>(send_buf + send_meta_offsets[dst_rank] + pos * META_DIM * sizeof(int));
     for (int m = 0; m < META_DIM; ++m) meta_write_ptr[m] = meta_read_ptr[m];
 }
-
 __global__ void unpack_to_intermediate_kernel(const unsigned char* recv_buf, __half* intermediate_buf, const int* recv_data_byte_offsets, const int* recv_meta_byte_offsets, const int* recv_counts, int total_recv, int hidden_dim, int experts_per_token) {
     __shared__ int s_recv_offsets[WORLD_SIZE + 1];
     if (threadIdx.x == 0) {
@@ -149,7 +149,6 @@ __global__ void unpack_to_intermediate_kernel(const unsigned char* recv_buf, __h
     __half* intermediate_write_ptr = &intermediate_buf[(src_token * experts_per_token + src_k) * hidden_dim];
     VECTORIZE_COPY(intermediate_write_ptr, data_read_ptr, hidden_dim);
 }
-
 __global__ void final_reduction_kernel_smem(const __half* intermediate_buf, const float* weights, __half* out_tokens, int num_tokens, int hidden_dim, int experts_per_token) {
     extern __shared__ float s_weights[];
     int token_idx = blockIdx.x;
@@ -165,37 +164,48 @@ __global__ void final_reduction_kernel_smem(const __half* intermediate_buf, cons
     }
 }
 
-// --- V7 New Kernel: Permute from sorted map (NO ATOMICS) ---
-__global__ void permute_and_pack_from_sorted_map_kernel(
-    const __half* original_tokens, const int* indices,
-    const long* sorted_dispatch_indices, const int* sorted_dispatch_map_flat,
-    unsigned char* send_buf, const int* send_offsets,
-    const int* send_data_offsets, const int* send_meta_offsets,
-    int num_total_dispatches, int hidden_dim, int rank, int num_local_experts, int experts_per_token)
-{
-    // Each thread handles one dispatch item from the sorted list
+// --- V8 New Kernels ---
+
+// Step 1: Create compact keys for sorting.
+__global__ void create_sort_keys_kernel(const int* dispatch_map, uint64_t* sort_keys, int total_dispatches) {
     int tid = threadIdx.x + blockDim.x * blockIdx.x;
-    if (tid >= num_total_dispatches) return;
+    if (tid >= total_dispatches) return;
 
-    // 1. Find which rank this thread's item belongs to and its intra-rank index.
-    // send_offsets contains the starting index for each rank's data in the sorted map.
-    int dst_rank = sorted_dispatch_map_flat[tid * 3 + 0];
-    int intra_rank_idx = tid - send_offsets[dst_rank];
+    uint64_t dst_rank = (uint64_t)dispatch_map[tid * 3 + 0];
+    
+    // Pack dst_rank into the high 32 bits and the original index (tid) into the low 32 bits.
+    sort_keys[tid] = (dst_rank << 32) | tid;
+}
 
-    // 2. Get the original token_idx and expert_idx for this dispatch item.
-    // sorted_dispatch_map_flat is already sorted by dst_rank.
-    int token_idx  = sorted_dispatch_map_flat[tid * 3 + 1];
-    int expert_idx = sorted_dispatch_map_flat[tid * 3 + 2];
+// Step 2: Permute and pack data using the sorted keys. NO ATOMICS.
+__global__ void permute_and_pack_from_sorted_keys_kernel(
+    const __half* original_tokens, const int* indices, const int* dispatch_map,
+    const uint64_t* sorted_keys, unsigned char* send_buf,
+    const int* send_offsets_in_map, const int* send_data_offsets,
+    const int* send_meta_offsets, int total_dispatches,
+    int hidden_dim, int rank, int num_local_experts, int experts_per_token)
+{
+    int tid = threadIdx.x + blockDim.x * blockIdx.x;
+    if (tid >= total_dispatches) return;
 
-    // 3. Write data and metadata to the correct position WITHOUT atomics.
-    // The position 'pos' is simply the intra_rank_idx.
+    uint64_t key = sorted_keys[tid];
+    uint32_t original_tid = key & 0xFFFFFFFF;
+    uint32_t dst_rank = key >> 32;
+
+    const int* map_entry = &dispatch_map[original_tid * 3];
+    int token_idx  = map_entry[1];
+    int expert_idx = map_entry[2];
+
+    int intra_rank_idx = tid - send_offsets_in_map[dst_rank];
+
     __half* data_write_ptr = reinterpret_cast<__half*>(send_buf + send_data_offsets[dst_rank] + intra_rank_idx * hidden_dim * sizeof(__half));
     const __half* data_read_ptr = &original_tokens[token_idx * hidden_dim];
     VECTORIZE_COPY(data_write_ptr, data_read_ptr, hidden_dim);
 
     int* meta_write_ptr = reinterpret_cast<int*>(send_buf + send_meta_offsets[dst_rank] + intra_rank_idx * META_DIM * sizeof(int));
-    int expert_id = indices[token_idx * experts_per_token + expert_idx];
-    meta_write_ptr[0] = expert_id;
+    int global_expert_id = indices[token_idx * experts_per_token + expert_idx];
+    
+    meta_write_ptr[0] = global_expert_id;
     meta_write_ptr[1] = rank;
     meta_write_ptr[2] = token_idx;
     meta_write_ptr[3] = expert_idx;
@@ -211,14 +221,25 @@ void hip_gather_and_pack(torch::Tensor ey, torch::Tensor em, torch::Tensor en, t
 void hip_unpack_to_intermediate(torch::Tensor rb, torch::Tensor ib, torch::Tensor rdo, torch::Tensor rmo, torch::Tensor rc, int t, int h, int e) { unpack_to_intermediate_kernel<<<(t+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>((const unsigned char*)rb.data_ptr(), (__half*)ib.data_ptr<at::Half>(), rdo.data_ptr<int>(), rmo.data_ptr<int>(), rc.data_ptr<int>(), t, h, e); }
 void hip_final_reduction_smem(torch::Tensor ib, torch::Tensor w, torch::Tensor ot, int n, int h, int e) { size_t smem = e * sizeof(float); final_reduction_kernel_smem<<<n, BLOCK_SIZE, smem>>>((const __half*)ib.data_ptr<at::Half>(), w.data_ptr<float>(), (__half*)ot.data_ptr<at::Half>(), n, h, e); }
 
-void hip_permute_and_pack_from_sorted_map(torch::Tensor o, torch::Tensor i, torch::Tensor sdi, torch::Tensor sdmf, torch::Tensor s, torch::Tensor so, torch::Tensor sdo, torch::Tensor smo, int n, int e, int h, int r, int l) {
-    int total_dispatches = n * e;
-    permute_and_pack_from_sorted_map_kernel<<<(total_dispatches + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
-        (const __half*)o.data_ptr<at::Half>(), i.data_ptr<int>(),
-        sdi.data_ptr<long>(), sdmf.data_ptr<int>(),
-        (unsigned char*)s.data_ptr(), so.data_ptr<int>(),
-        sdo.data_ptr<int>(), smo.data_ptr<int>(),
-        total_dispatches, h, r, l, e
+void hip_create_sort_keys(torch::Tensor dispatch_map, torch::Tensor sort_keys, int total_dispatches) {
+    create_sort_keys_kernel<<<(total_dispatches + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+        dispatch_map.data_ptr<int>(), (uint64_t*)sort_keys.data_ptr<long long>(), total_dispatches
+    );
+}
+
+void hip_permute_and_pack_from_sorted_keys(
+    torch::Tensor original_tokens, torch::Tensor indices, torch::Tensor dispatch_map,
+    torch::Tensor sorted_keys, torch::Tensor send_buf,
+    torch::Tensor send_offsets_in_map, torch::Tensor send_data_offsets,
+    torch::Tensor send_meta_offsets, int total_dispatches,
+    int hidden_dim, int rank, int num_local_experts, int experts_per_token)
+{
+    permute_and_pack_from_sorted_keys_kernel<<<(total_dispatches + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(
+        (const __half*)original_tokens.data_ptr<at::Half>(), indices.data_ptr<int>(), dispatch_map.data_ptr<int>(),
+        (const uint64_t*)sorted_keys.data_ptr<long long>(), (unsigned char*)send_buf.data_ptr(),
+        send_offsets_in_map.data_ptr<int>(), send_data_offsets.data_ptr<int>(),
+        send_meta_offsets.data_ptr<int>(), total_dispatches,
+        hidden_dim, rank, num_local_experts, experts_per_token
     );
 }
 
@@ -226,14 +247,14 @@ void hip_permute_and_pack_from_sorted_map(torch::Tensor o, torch::Tensor i, torc
 
 # Compile HIP module
 hip_module = load_inline(
-    name='hip_all2all_v7_sort', # Renamed to avoid cache conflicts
+    name='hip_all2all_v8_compact_sort', # Renamed to avoid cache conflicts
     cpp_sources=[CPP_WRAPPER],
     cuda_sources=[CUDA_SRC],
     functions=[
         'hip_count_and_map_dispatches', 'hip_unpack_and_reorganize',
         'hip_count_backward_sends', 'hip_gather_and_pack',
         'hip_unpack_to_intermediate', 'hip_final_reduction_smem',
-        'hip_permute_and_pack_from_sorted_map' # New kernel
+        'hip_create_sort_keys', 'hip_permute_and_pack_from_sorted_keys'
     ],
     verbose=True,
     extra_cuda_cflags=["--offload-arch=gfx942", "-std=c++20", "-O3"],
@@ -256,51 +277,44 @@ class HIPAllToAll:
         total_dispatches = num_tokens * experts_per_token
         indices_int = indices.to(torch.int32)
 
-        # 1. Count tokens per destination and create the initial dispatch map (same as v6)
+        # 1. Count tokens and create the initial map (unchanged)
         send_counts = torch.zeros(self.world_size, dtype=torch.int32, device=device)
         dispatch_map = torch.empty(total_dispatches, 3, dtype=torch.int32, device=device)
         hip_module.hip_count_and_map_dispatches(indices_int, send_counts, dispatch_map, num_tokens, experts_per_token, self.num_local_experts)
 
-        # --- NEW: Sort the dispatch map by destination rank ---
-        # This is the core of the new strategy.
-        # We sort based on the first column (dst_rank) of the dispatch_map.
-        # `sorted_indices` will store the original positions, which we don't need for permutation,
-        # but the sorting operation gives us the sorted map.
-        # Note: The sort operation itself happens on the GPU and is highly optimized.
-        _, sorted_indices = torch.sort(dispatch_map[:, 0])
-        sorted_dispatch_map = dispatch_map[sorted_indices]
+        # 2. --- NEW: Create compact uint64_t keys for sorting ---
+        sort_keys = torch.empty(total_dispatches, dtype=torch.int64, device=device)
+        hip_module.hip_create_sort_keys(dispatch_map, sort_keys, total_dispatches)
+        
+        # 3. --- NEW: Sort the compact keys ---
+        # This is much faster than sorting the (N, 3) tensor from v7.
+        sorted_keys, _ = torch.sort(sort_keys)
 
-        # 2. Exchange counts (same as v6, needed for All-to-All)
+        # 4. Exchange counts (unchanged)
         recv_counts_t = torch.empty_like(send_counts, dtype=torch.long)
         dist.all_to_all_single(recv_counts_t, send_counts.to(torch.long))
         recv_counts = recv_counts_t.to(torch.int32)
         total_recv = int(recv_counts.sum().item())
 
-        # 3. Prepare buffers for fused communication (same as v6)
+        # 5. Prepare buffers for fused communication (unchanged)
         send_data_bytes = send_counts * cfg.hidden_dim * 2
         send_meta_bytes = send_counts * self.META_DIM * 4
         send_split_bytes = send_data_bytes + send_meta_bytes
-        send_buf_total_bytes = send_split_bytes.sum().item()
-        send_buf = torch.empty(send_buf_total_bytes, dtype=torch.uint8, device=device)
+        send_buf = torch.empty(send_split_bytes.sum().item(), dtype=torch.uint8, device=device)
 
-        # Calculate offsets for data and metadata within the single send_buf
         send_block_offsets = torch.cumsum(send_split_bytes, 0, dtype=torch.int32) - send_split_bytes
         send_data_offsets = send_block_offsets
         send_meta_offsets = send_block_offsets + send_data_bytes
-
-        # Calculate offsets needed by the new kernel to know where each rank's data begins in the sorted map
         send_offsets_in_map = torch.cumsum(send_counts, 0, dtype=torch.int32) - send_counts
 
-        # 4. --- MODIFIED: Call the new permutation kernel ---
-        # This kernel reads from the `sorted_dispatch_map` and writes to `send_buf` without any atomics.
-        hip_module.hip_permute_and_pack_from_sorted_map(
-            dp_x, indices_int, sorted_indices, sorted_dispatch_map.view(-1),
-            send_buf, send_offsets_in_map,
-            send_data_offsets, send_meta_offsets,
-            num_tokens, experts_per_token, cfg.hidden_dim, self.rank, self.num_local_experts
+        # 6. --- MODIFIED: Call the new permutation kernel with sorted keys ---
+        hip_module.hip_permute_and_pack_from_sorted_keys(
+            dp_x, indices_int, dispatch_map, sorted_keys, send_buf,
+            send_offsets_in_map, send_data_offsets, send_meta_offsets,
+            total_dispatches, cfg.hidden_dim, self.rank, self.num_local_experts, experts_per_token
         )
 
-        # 5. Perform All-to-All and unpack (same as v6)
+        # 7. Perform All-to-All and unpack (unchanged)
         recv_data_bytes = recv_counts * cfg.hidden_dim * 2
         recv_meta_bytes = recv_counts * self.META_DIM * 4
         recv_split_bytes = recv_data_bytes + recv_meta_bytes
@@ -320,8 +334,7 @@ class HIPAllToAll:
         return expert_num_tokens, expert_x, expert_meta
 
     def combine(self, out_tokens: torch.Tensor, weights: torch.Tensor, expert_meta: torch.Tensor, expert_y: torch.Tensor, expert_num_tokens: torch.Tensor, num_tokens: int):
-        # The combine logic from v6 is already highly optimized with the two-stage approach.
-        # We can reuse it directly.
+        # The combine logic from v6/v7 is already highly optimized. We reuse it directly.
         device = out_tokens.device
         cfg = self.cfg
 
@@ -379,4 +392,3 @@ def custom_kernel(data: input_t) -> output_t:
     )
     hip_all2all.combine(y, rank_data.weights, expert_meta, expert_y, expert_num, rank_data.num_tokens)
     return y
-
