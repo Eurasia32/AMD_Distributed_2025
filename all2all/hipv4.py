@@ -41,7 +41,7 @@ CUDA_SRC = """
 #include <hip/hip_runtime.h>
 #include <hip/amd_detail/amd_hip_fp16.h>
 
-constexpr const int BLOCK_SIZE = 256;
+constexpr const int BLOCK_SIZE = 128;
 constexpr const int META_DIM = 5; // Must match META_DIM in Python
 
 // Kernel 1: Count tokens per destination rank and create a map for permutation.

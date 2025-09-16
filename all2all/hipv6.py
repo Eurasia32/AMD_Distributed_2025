@@ -37,8 +37,8 @@ void hip_unpack_to_intermediate(torch::Tensor recv_buf, torch::Tensor intermedia
                                 torch::Tensor recv_data_byte_offsets, torch::Tensor recv_meta_byte_offsets,
                                 torch::Tensor recv_counts, int total_recv, int hidden_dim, int experts_per_token);
 
-void hip_final_reduction(torch::Tensor intermediate_buf, torch::Tensor weights, torch::Tensor out_tokens,
-                         int num_tokens, int hidden_dim, int experts_per_token);
+void hip_final_reduction_smem(torch::Tensor intermediate_buf, torch::Tensor weights, torch::Tensor out_tokens,
+                              int num_tokens, int hidden_dim, int experts_per_token);
 """
 
 CUDA_SRC = """
@@ -181,7 +181,7 @@ __global__ void gather_and_pack_kernel(const __half* expert_y, const int* expert
     }
 }
 
-// Kernel 6 (NEW): Unpack from the unified buffer to an intermediate buffer (NO ATOMICS).
+// Kernel 6: Unpack to intermediate buffer (Unchanged)
 __global__ void unpack_to_intermediate_kernel(const unsigned char* recv_buf, __half* intermediate_buf,
                                               const int* recv_data_byte_offsets, const int* recv_meta_byte_offsets,
                                               const int* recv_counts, int total_recv, int hidden_dim, int experts_per_token) {
@@ -206,27 +206,37 @@ __global__ void unpack_to_intermediate_kernel(const unsigned char* recv_buf, __h
     int src_token = meta_read_ptr[2];
     int src_k = meta_read_ptr[3];
 
-    // Write to a unique slot in the intermediate buffer, no atomics needed.
     __half* intermediate_write_ptr = &intermediate_buf[(src_token * experts_per_token + src_k) * hidden_dim];
     VECTORIZE_COPY(intermediate_write_ptr, data_read_ptr, hidden_dim);
 }
 
-// Kernel 7 (NEW): Perform final weighted reduction from intermediate buffer (NO ATOMICS).
-__global__ void final_reduction_kernel(const __half* intermediate_buf, const float* weights, __half* out_tokens,
-                                       int num_tokens, int hidden_dim, int experts_per_token) {
-    // Each block processes one token.
+// Kernel 7 (IMPROVED): Final reduction using shared memory for weights.
+__global__ void final_reduction_kernel_smem(const __half* intermediate_buf, const float* weights, __half* out_tokens,
+                                            int num_tokens, int hidden_dim, int experts_per_token) {
+    // Dynamically allocated shared memory for weights.
+    extern __shared__ float s_weights[];
+
     int token_idx = blockIdx.x;
     if (token_idx >= num_tokens) return;
 
-    // Threads in the block cooperate to cover the hidden_dim using a grid-stride loop.
+    // Threads cooperatively load weights for the current token into shared memory.
+    if (threadIdx.x < experts_per_token) {
+        s_weights[threadIdx.x] = weights[token_idx * experts_per_token + threadIdx.x];
+    }
+    __syncthreads(); // Ensure all weights are loaded before proceeding.
+
+    // Grid-stride loop to cover the hidden_dim.
     for (int h = threadIdx.x; h < hidden_dim; h += blockDim.x) {
         float sum = 0.0f;
+        
+        // Unroll hint for the compiler, as experts_per_token is small.
+        #pragma unroll
         for (int k = 0; k < experts_per_token; ++k) {
-            float weight = weights[token_idx * experts_per_token + k];
+            // Read weight from fast shared memory.
+            float weight = s_weights[k];
             float val = __half2float(intermediate_buf[(token_idx * experts_per_token + k) * hidden_dim + h]);
             sum += val * weight;
         }
-        // Each thread writes its computed sum for its assigned 'h' position.
         out_tokens[token_idx * hidden_dim + h] = __float2half(sum);
     }
 }
@@ -251,21 +261,23 @@ void hip_gather_and_pack(torch::Tensor ey, torch::Tensor em, torch::Tensor en, t
 void hip_unpack_to_intermediate(torch::Tensor recv_buf, torch::Tensor intermediate_buf, torch::Tensor rdo, torch::Tensor rmo, torch::Tensor rc, int t, int h, int e) {
     unpack_to_intermediate_kernel<<<(t + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>((const unsigned char*)recv_buf.data_ptr(), (__half*)intermediate_buf.data_ptr<at::Half>(), rdo.data_ptr<int>(), rmo.data_ptr<int>(), rc.data_ptr<int>(), t, h, e);
 }
-void hip_final_reduction(torch::Tensor intermediate_buf, torch::Tensor weights, torch::Tensor out_tokens, int n, int h, int e) {
+void hip_final_reduction_smem(torch::Tensor intermediate_buf, torch::Tensor weights, torch::Tensor out_tokens, int n, int h, int e) {
     // Launch one block per token, with BLOCK_SIZE threads per block.
-    final_reduction_kernel<<<n, BLOCK_SIZE>>>( (const __half*)intermediate_buf.data_ptr<at::Half>(), weights.data_ptr<float>(), (__half*)out_tokens.data_ptr<at::Half>(), n, h, e);
+    // Allocate dynamic shared memory: experts_per_token * sizeof(float)
+    size_t shared_mem_size = e * sizeof(float);
+    final_reduction_kernel_smem<<<n, BLOCK_SIZE, shared_mem_size>>>( (const __half*)intermediate_buf.data_ptr<at::Half>(), weights.data_ptr<float>(), (__half*)out_tokens.data_ptr<at::Half>(), n, h, e);
 }
 """
 
 # Compile HIP module
 hip_module = load_inline(
-    name='hip_all2all_fused_v2',
+    name='hip_all2all_fused_v3_smem',
     cpp_sources=[CPP_WRAPPER],
     cuda_sources=[CUDA_SRC],
     functions=[
         'hip_count_and_map_dispatches', 'hip_permute_and_pack', 'hip_unpack_and_reorganize',
         'hip_count_backward_sends', 'hip_gather_and_pack', 
-        'hip_unpack_to_intermediate', 'hip_final_reduction'
+        'hip_unpack_to_intermediate', 'hip_final_reduction_smem'
     ],
     verbose=True,
     extra_cuda_cflags=["--offload-arch=gfx942", "-std=c++20", "-O3"],
@@ -371,8 +383,8 @@ class HIPAllToAll:
             recv_meta_byte_offsets = recv_offsets + recv_data_bytes
             hip_module.hip_unpack_to_intermediate(recv_buf, intermediate_buf, recv_data_byte_offsets, recv_meta_byte_offsets, recv_counts, total_recv, cfg.hidden_dim, cfg.experts_per_token)
 
-            # Stage 2: Final weighted reduction from intermediate buffer
-            hip_module.hip_final_reduction(intermediate_buf, weights, out_tokens, num_tokens, cfg.hidden_dim, cfg.experts_per_token)
+            # Stage 2: Final weighted reduction from intermediate buffer using shared memory
+            hip_module.hip_final_reduction_smem(intermediate_buf, weights, out_tokens, num_tokens, cfg.hidden_dim, cfg.experts_per_token)
 
         return out_tokens
 
