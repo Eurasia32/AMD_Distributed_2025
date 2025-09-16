@@ -9,34 +9,28 @@ from task import input_t, output_t
 # HIP kernel compilation setup
 os.environ["CXX"] = "clang++"
 
+# The Python host code is identical to hipv6.py.
+# The optimization is purely inside the HIP kernel source code.
 CPP_WRAPPER = """
-// Forward declarations for the fused communication implementation
 void hip_count_and_map_dispatches(torch::Tensor indices, torch::Tensor send_counts, torch::Tensor dispatch_map,
                                   int num_tokens, int experts_per_token, int num_local_experts);
-
 void hip_permute_and_pack(torch::Tensor original_tokens, torch::Tensor indices, torch::Tensor dispatch_map,
                            torch::Tensor temp_send_counts, torch::Tensor send_buf,
                            torch::Tensor send_data_offsets, torch::Tensor send_meta_offsets,
                            int num_tokens, int experts_per_token, int hidden_dim, int rank, int num_local_experts);
-
 void hip_unpack_and_reorganize(torch::Tensor recv_buf, torch::Tensor expert_x, torch::Tensor expert_meta,
                                 torch::Tensor expert_num_tokens, torch::Tensor recv_data_byte_offsets,
                                 torch::Tensor recv_meta_byte_offsets, torch::Tensor recv_counts,
                                 int total_recv, int num_local_experts, int hidden_dim, int max_recv);
-
 void hip_count_backward_sends(torch::Tensor expert_meta, torch::Tensor expert_num_tokens,
                               torch::Tensor send_counts, int num_local_experts, int max_recv);
-
 void hip_gather_and_pack(torch::Tensor expert_y, torch::Tensor expert_meta, torch::Tensor expert_num_tokens,
                           torch::Tensor temp_send_counts, torch::Tensor send_buf,
                           torch::Tensor send_data_offsets, torch::Tensor send_meta_offsets,
                           int num_local_experts, int max_recv, int hidden_dim);
-
-// New kernels for two-stage combine
 void hip_unpack_to_intermediate(torch::Tensor recv_buf, torch::Tensor intermediate_buf,
                                 torch::Tensor recv_data_byte_offsets, torch::Tensor recv_meta_byte_offsets,
                                 torch::Tensor recv_counts, int total_recv, int hidden_dim, int experts_per_token);
-
 void hip_final_reduction_smem(torch::Tensor intermediate_buf, torch::Tensor weights, torch::Tensor out_tokens,
                               int num_tokens, int hidden_dim, int experts_per_token);
 """
@@ -45,11 +39,10 @@ CUDA_SRC = """
 #include <hip/hip_runtime.h>
 #include <hip/amd_detail/amd_hip_fp16.h>
 
-constexpr const int BLOCK_SIZE = 128; // Optimized based on user feedback
+constexpr const int BLOCK_SIZE = 128;
 constexpr const int META_DIM = 5;
-constexpr const int WORLD_SIZE = 8; // Hardcoded for this specific hardware setup
+constexpr const int WORLD_SIZE = 8;
 
-// --- Helper for vectorized memory copy ---
 #define VECTORIZE_COPY(dst, src, hidden_dim) \\
     do { \\
         const int4* src_vec = reinterpret_cast<const int4*>(src); \\
@@ -59,22 +52,46 @@ constexpr const int WORLD_SIZE = 8; // Hardcoded for this specific hardware setu
         } \\
     } while (0)
 
-// --- Dispatch Kernels (Unchanged) ---
-
+// Kernel 1 (IMPROVED): Count tokens and map using shared memory to reduce global atomics.
 __global__ void count_and_map_kernel(const int* indices, int* send_counts, int* dispatch_map,
                                      int num_tokens, int experts_per_token, int num_local_experts) {
-    int tid = threadIdx.x + blockDim.x * blockIdx.x;
-    if (tid >= num_tokens * experts_per_token) return;
-    int token_idx = tid / experts_per_token;
-    int expert_idx = tid % experts_per_token;
-    int expert_id = indices[token_idx * experts_per_token + expert_idx];
-    int dst_rank = expert_id / num_local_experts;
-    atomicAdd(&send_counts[dst_rank], 1);
-    int map_offset = tid * 3;
-    dispatch_map[map_offset + 0] = dst_rank;
-    dispatch_map[map_offset + 1] = token_idx;
-    dispatch_map[map_offset + 2] = expert_idx;
+    // Shared memory for per-block reduction of send_counts
+    __shared__ int s_send_counts[WORLD_SIZE];
+
+    // Initialize shared memory to zero by the first few threads in the block
+    if (threadIdx.x < WORLD_SIZE) {
+        s_send_counts[threadIdx.x] = 0;
+    }
+    __syncthreads();
+
+    // Use a grid-stride loop to ensure all elements are processed
+    for (int tid = threadIdx.x + blockDim.x * blockIdx.x; 
+         tid < num_tokens * experts_per_token; 
+         tid += gridDim.x * blockDim.x) 
+    {
+        int token_idx = tid / experts_per_token;
+        int expert_idx = tid % experts_per_token;
+        int expert_id = indices[token_idx * experts_per_token + expert_idx];
+        int dst_rank = expert_id / num_local_experts;
+
+        // Perform atomicAdd on fast shared memory
+        atomicAdd(&s_send_counts[dst_rank], 1);
+
+        // The mapping part writes directly to global memory as before
+        int map_offset = tid * 3;
+        dispatch_map[map_offset + 0] = dst_rank;
+        dispatch_map[map_offset + 1] = token_idx;
+        dispatch_map[map_offset + 2] = expert_idx;
+    }
+
+    __syncthreads();
+
+    // The first few threads of the block write the aggregated results to global memory
+    if (threadIdx.x < WORLD_SIZE) {
+        atomicAdd(&send_counts[threadIdx.x], s_send_counts[threadIdx.x]);
+    }
 }
+
 
 __global__ void permute_and_pack_kernel(const __half* original_tokens, const int* indices, const int* dispatch_map,
                                         int* temp_send_counts, unsigned char* send_buf,
@@ -144,10 +161,6 @@ __global__ void unpack_and_reorganize_kernel(const unsigned char* recv_buf, __ha
     }
 }
 
-
-// --- Combine Kernels ---
-
-// Kernel 4: Count backward sends (Unchanged)
 __global__ void count_backward_kernel(const int* expert_meta, const int* expert_num_tokens,
                                       int* send_counts, int num_local_experts, int max_recv) {
     int local_eid = blockIdx.x;
@@ -159,7 +172,6 @@ __global__ void count_backward_kernel(const int* expert_meta, const int* expert_
     }
 }
 
-// Kernel 5: Gather and pack (Unchanged)
 __global__ void gather_and_pack_kernel(const __half* expert_y, const int* expert_meta, const int* expert_num_tokens,
                                        int* temp_send_counts, unsigned char* send_buf,
                                        const int* send_data_offsets, const int* send_meta_offsets,
@@ -181,7 +193,6 @@ __global__ void gather_and_pack_kernel(const __half* expert_y, const int* expert
     }
 }
 
-// Kernel 6: Unpack to intermediate buffer (Unchanged)
 __global__ void unpack_to_intermediate_kernel(const unsigned char* recv_buf, __half* intermediate_buf,
                                               const int* recv_data_byte_offsets, const int* recv_meta_byte_offsets,
                                               const int* recv_counts, int total_recv, int hidden_dim, int experts_per_token) {
@@ -210,29 +221,23 @@ __global__ void unpack_to_intermediate_kernel(const unsigned char* recv_buf, __h
     VECTORIZE_COPY(intermediate_write_ptr, data_read_ptr, hidden_dim);
 }
 
-// Kernel 7 (IMPROVED): Final reduction using shared memory for weights.
 __global__ void final_reduction_kernel_smem(const __half* intermediate_buf, const float* weights, __half* out_tokens,
                                             int num_tokens, int hidden_dim, int experts_per_token) {
-    // Dynamically allocated shared memory for weights.
     extern __shared__ float s_weights[];
 
     int token_idx = blockIdx.x;
     if (token_idx >= num_tokens) return;
 
-    // Threads cooperatively load weights for the current token into shared memory.
     if (threadIdx.x < experts_per_token) {
         s_weights[threadIdx.x] = weights[token_idx * experts_per_token + threadIdx.x];
     }
-    __syncthreads(); // Ensure all weights are loaded before proceeding.
+    __syncthreads();
 
-    // Grid-stride loop to cover the hidden_dim.
     for (int h = threadIdx.x; h < hidden_dim; h += blockDim.x) {
         float sum = 0.0f;
         
-        // Unroll hint for the compiler, as experts_per_token is small.
         #pragma unroll
         for (int k = 0; k < experts_per_token; ++k) {
-            // Read weight from fast shared memory.
             float weight = s_weights[k];
             float val = __half2float(intermediate_buf[(token_idx * experts_per_token + k) * hidden_dim + h]);
             sum += val * weight;
@@ -241,37 +246,18 @@ __global__ void final_reduction_kernel_smem(const __half* intermediate_buf, cons
     }
 }
 
-
-// --- C++ Wrapper Functions ---
-void hip_count_and_map_dispatches(torch::Tensor indices, torch::Tensor send_counts, torch::Tensor dispatch_map, int n, int e, int l) {
-    count_and_map_kernel<<<(n * e + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>(indices.data_ptr<int>(), send_counts.data_ptr<int>(), dispatch_map.data_ptr<int>(), n, e, l);
-}
-void hip_permute_and_pack(torch::Tensor o, torch::Tensor i, torch::Tensor d, torch::Tensor t, torch::Tensor s, torch::Tensor sdo, torch::Tensor smo, int n, int e, int h, int r, int l) {
-    permute_and_pack_kernel<<<(n * e + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>((const __half*)o.data_ptr<at::Half>(), i.data_ptr<int>(), d.data_ptr<int>(), t.data_ptr<int>(), (unsigned char*)s.data_ptr(), sdo.data_ptr<int>(), smo.data_ptr<int>(), n, e, h, r, l);
-}
-void hip_unpack_and_reorganize(torch::Tensor r, torch::Tensor ex, torch::Tensor em, torch::Tensor en, torch::Tensor rdo, torch::Tensor rmo, torch::Tensor rc, int t, int l, int h, int mr) {
-    unpack_and_reorganize_kernel<<<(t + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>((const unsigned char*)r.data_ptr(), (__half*)ex.data_ptr<at::Half>(), em.data_ptr<int>(), en.data_ptr<int>(), rdo.data_ptr<int>(), rmo.data_ptr<int>(), rc.data_ptr<int>(), t, l, h, mr);
-}
-void hip_count_backward_sends(torch::Tensor em, torch::Tensor en, torch::Tensor sc, int l, int mr) {
-    count_backward_kernel<<<l, BLOCK_SIZE>>>(em.data_ptr<int>(), en.data_ptr<int>(), sc.data_ptr<int>(), l, mr);
-}
-void hip_gather_and_pack(torch::Tensor ey, torch::Tensor em, torch::Tensor en, torch::Tensor t, torch::Tensor s, torch::Tensor sdo, torch::Tensor smo, int l, int mr, int h) {
-    gather_and_pack_kernel<<<l, BLOCK_SIZE>>>((const __half*)ey.data_ptr<at::Half>(), em.data_ptr<int>(), en.data_ptr<int>(), t.data_ptr<int>(), (unsigned char*)s.data_ptr(), sdo.data_ptr<int>(), smo.data_ptr<int>(), l, mr, h);
-}
-void hip_unpack_to_intermediate(torch::Tensor recv_buf, torch::Tensor intermediate_buf, torch::Tensor rdo, torch::Tensor rmo, torch::Tensor rc, int t, int h, int e) {
-    unpack_to_intermediate_kernel<<<(t + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE>>>((const unsigned char*)recv_buf.data_ptr(), (__half*)intermediate_buf.data_ptr<at::Half>(), rdo.data_ptr<int>(), rmo.data_ptr<int>(), rc.data_ptr<int>(), t, h, e);
-}
-void hip_final_reduction_smem(torch::Tensor intermediate_buf, torch::Tensor weights, torch::Tensor out_tokens, int n, int h, int e) {
-    // Launch one block per token, with BLOCK_SIZE threads per block.
-    // Allocate dynamic shared memory: experts_per_token * sizeof(float)
-    size_t shared_mem_size = e * sizeof(float);
-    final_reduction_kernel_smem<<<n, BLOCK_SIZE, shared_mem_size>>>( (const __half*)intermediate_buf.data_ptr<at::Half>(), weights.data_ptr<float>(), (__half*)out_tokens.data_ptr<at::Half>(), n, h, e);
-}
+void hip_count_and_map_dispatches(torch::Tensor i, torch::Tensor sc, torch::Tensor dm, int n, int e, int l) { count_and_map_kernel<<<(n*e+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>(i.data_ptr<int>(), sc.data_ptr<int>(), dm.data_ptr<int>(), n, e, l); }
+void hip_permute_and_pack(torch::Tensor o, torch::Tensor i, torch::Tensor d, torch::Tensor t, torch::Tensor s, torch::Tensor sdo, torch::Tensor smo, int n, int e, int h, int r, int l) { permute_and_pack_kernel<<<(n*e+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>((const __half*)o.data_ptr<at::Half>(), i.data_ptr<int>(), d.data_ptr<int>(), t.data_ptr<int>(), (unsigned char*)s.data_ptr(), sdo.data_ptr<int>(), smo.data_ptr<int>(), n, e, h, r, l); }
+void hip_unpack_and_reorganize(torch::Tensor r, torch::Tensor ex, torch::Tensor em, torch::Tensor en, torch::Tensor rdo, torch::Tensor rmo, torch::Tensor rc, int t, int l, int h, int mr) { unpack_and_reorganize_kernel<<<(t+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>((const unsigned char*)r.data_ptr(), (__half*)ex.data_ptr<at::Half>(), em.data_ptr<int>(), en.data_ptr<int>(), rdo.data_ptr<int>(), rmo.data_ptr<int>(), rc.data_ptr<int>(), t, l, h, mr); }
+void hip_count_backward_sends(torch::Tensor em, torch::Tensor en, torch::Tensor sc, int l, int mr) { count_backward_kernel<<<l, BLOCK_SIZE>>>(em.data_ptr<int>(), en.data_ptr<int>(), sc.data_ptr<int>(), l, mr); }
+void hip_gather_and_pack(torch::Tensor ey, torch::Tensor em, torch::Tensor en, torch::Tensor t, torch::Tensor s, torch::Tensor sdo, torch::Tensor smo, int l, int mr, int h) { gather_and_pack_kernel<<<l, BLOCK_SIZE>>>((const __half*)ey.data_ptr<at::Half>(), em.data_ptr<int>(), en.data_ptr<int>(), t.data_ptr<int>(), (unsigned char*)s.data_ptr(), sdo.data_ptr<int>(), smo.data_ptr<int>(), l, mr, h); }
+void hip_unpack_to_intermediate(torch::Tensor rb, torch::Tensor ib, torch::Tensor rdo, torch::Tensor rmo, torch::Tensor rc, int t, int h, int e) { unpack_to_intermediate_kernel<<<(t+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE>>>((const unsigned char*)rb.data_ptr(), (__half*)ib.data_ptr<at::Half>(), rdo.data_ptr<int>(), rmo.data_ptr<int>(), rc.data_ptr<int>(), t, h, e); }
+void hip_final_reduction_smem(torch::Tensor ib, torch::Tensor w, torch::Tensor ot, int n, int h, int e) { size_t smem = e * sizeof(float); final_reduction_kernel_smem<<<n, BLOCK_SIZE, smem>>>((const __half*)ib.data_ptr<at::Half>(), w.data_ptr<float>(), (__half*)ot.data_ptr<at::Half>(), n, h, e); }
 """
 
 # Compile HIP module
 hip_module = load_inline(
-    name='hip_all2all_fused_v3_smem',
+    name='hip_all2all_fused_v11_kernel_opt', # Renamed to avoid cache conflicts
     cpp_sources=[CPP_WRAPPER],
     cuda_sources=[CUDA_SRC],
     functions=[
@@ -299,7 +285,7 @@ class HIPAllToAll:
         num_tokens, experts_per_token = indices.shape
         indices_int = indices.to(torch.int32)
 
-        # Stages 1-5 are the same as the previous fused version
+        # This is the simple, robust, single-stream execution model from hipv6
         send_counts = torch.zeros(self.world_size, dtype=torch.int32, device=device)
         dispatch_map = torch.empty(num_tokens * experts_per_token, 3, dtype=torch.int32, device=device)
         hip_module.hip_count_and_map_dispatches(indices_int, send_counts, dispatch_map, num_tokens, experts_per_token, self.num_local_experts)
@@ -342,7 +328,6 @@ class HIPAllToAll:
         device = out_tokens.device
         cfg = self.cfg
 
-        # 1. Count and exchange backward send counts
         send_counts = torch.zeros(self.world_size, dtype=torch.int32, device=device)
         hip_module.hip_count_backward_sends(expert_meta, expert_num_tokens, send_counts, self.num_local_experts, self.max_recv)
 
@@ -351,7 +336,6 @@ class HIPAllToAll:
         recv_counts = recv_counts_t.to(torch.int32)
         total_recv = int(recv_counts.sum().item())
 
-        # 2. Pack and send data back
         total_sends = int(send_counts.sum().item())
         if total_sends > 0:
             send_data_bytes = send_counts * cfg.hidden_dim * 2
@@ -373,9 +357,7 @@ class HIPAllToAll:
         recv_buf = torch.empty(recv_split_bytes.sum().item(), dtype=torch.uint8, device=device)
         dist.all_to_all_single(recv_buf, send_buf, recv_split_bytes.tolist(), send_split_bytes.tolist())
 
-        # 3. Two-stage combine to eliminate atomics
         if total_recv > 0:
-            # Stage 1: Unpack to intermediate buffer
             intermediate_buf = torch.empty(num_tokens, cfg.experts_per_token, cfg.hidden_dim, dtype=cfg.out_dtype, device=device)
             
             recv_offsets = torch.cumsum(recv_split_bytes, 0, dtype=torch.int32) - recv_split_bytes
@@ -383,7 +365,6 @@ class HIPAllToAll:
             recv_meta_byte_offsets = recv_offsets + recv_data_bytes
             hip_module.hip_unpack_to_intermediate(recv_buf, intermediate_buf, recv_data_byte_offsets, recv_meta_byte_offsets, recv_counts, total_recv, cfg.hidden_dim, cfg.experts_per_token)
 
-            # Stage 2: Final weighted reduction from intermediate buffer using shared memory
             hip_module.hip_final_reduction_smem(intermediate_buf, weights, out_tokens, num_tokens, cfg.hidden_dim, cfg.experts_per_token)
 
         return out_tokens
@@ -391,17 +372,18 @@ class HIPAllToAll:
 def custom_kernel(data: input_t) -> output_t:
     cfg, rank_data, rank, world_size = data
     torch.cuda.set_device(rank)
+    
     hip_all2all = HIPAllToAll(cfg, rank, world_size)
+    
     expert_num, expert_x, expert_meta = hip_all2all.dispatch(rank_data.x, rank_data.indices)
     
     expert_y = expert_x.to(cfg.out_dtype) * (1 + rank)
     
     y = torch.zeros(
-        rank_data.num_tokens, # Only allocate for what's needed
+        rank_data.num_tokens,
         cfg.hidden_dim,
         dtype=cfg.out_dtype,
         device=rank_data.x.device,
     )
     hip_all2all.combine(y, rank_data.weights, expert_meta, expert_y, expert_num, rank_data.num_tokens)
     return y
-
